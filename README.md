@@ -69,10 +69,3 @@ Zenodo link: [https://zenodo.org/records/10963339](https://zenodo.org/records/10
 ![https://github.com/wang-fujin/PINN4SOH/blob/main/xjtu%20battery%20dataset.png](https://github.com/wang-fujin/PINN4SOH/blob/main/xjtu%20battery%20dataset.png)
 
 ![https://github.com/wang-fujin/PINN4SOH/blob/main/6%20batches.png](https://github.com/wang-fujin/PINN4SOH/blob/main/6%20batches.png)
-
-
-  pages={4332},
-  year={2024},
-  publisher={Nature Publishing Group UK London}
-}
-```
