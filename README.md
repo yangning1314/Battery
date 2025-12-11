@@ -37,8 +37,7 @@ conda install scikit-learn=1.3.2 numpy=1.24.3 pandas=2.0.3 matplotlib=3.7.5
 
 # 3. Demo
 We provide a detailed demo of our code running on the XJTU dataset.
-1. Run the `PINN.py` file to train our model. The program will generate a folder named `pinn_result.png` and save the results in it.
-2. Run the `MLP.py` file. The program will generate a folder named `multi_battery_result.png` and save the results in it.You can see the comparison results between MLP and PINN.
+Run the `Compare.py` file. The program will generate a folder named `myplot.png` and save the results in it.You can see the comparison results between MLP and PINN.
 
 
 **Note: As we all know, the training process of neural network models is random, 
