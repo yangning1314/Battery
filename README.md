@@ -24,7 +24,7 @@ If you are not familiar with Python and Pytorch framework,
 you can install Anaconda first and use Anaconda to quickly configure the environment.
 ## 2.1 Create environment
 ```angular2html
-conda create -n new_environment python=3.7.10
+conda create -n new_environment python=3.8
 ```
 
 

@@ -4,242 +4,341 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.autograd import grad
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_squared_error
 import matplotlib.pyplot as plt
+import logging
 
 # ==========================================
-# 0. 配置区域
+# 0. 基础配置
 # ==========================================
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 DATA_FOLDER = 'Batch-1'
-SAVE_IMG_PATH = 'multi_battery_result.png'
-RATED_CAPACITY = 2.0
-
-# 训练参数 (为 PINN 优化)
-EPOCHS = 1000
-LR = 0.005
-LAMBDA_PHY = 0.05  # 物理权重
-LAMBDA_MONO = 0.1  # 单调性权重 (在新电池上这很重要)
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+SAVE_IMG_PATH = 'Final_Comparison.png'
 
 
-# ==========================================
-# 1. 多文件数据加载模块
-# ==========================================
-def load_battery_data(folder, battery_ids):
-    """
-    读取指定 ID 列表的电池数据，并合并
-    battery_ids: list, e.g., [1, 2, 3, 4, 5, 6]
-    """
-    all_X = []
-    all_Y = []
+# 设置随机种子保证复现性
+def set_seed(seed=42):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-    print(f"正在加载电池 ID: {battery_ids} ...")
 
-    for bid in battery_ids:
-        filename = f"2C_battery-{bid}.csv"
-        path = os.path.join(folder, filename)
+set_seed(1234)
 
-        try:
-            # 兼容不同分隔符
-            df = pd.read_csv(path)
-            if df.shape[1] < 2: df = pd.read_csv(path, sep='\t')
 
-            # 清洗
-            df.replace([np.inf, -np.inf], np.nan, inplace=True)
-            df.dropna(inplace=True)
+# Logger
+def get_logger():
+    logger = logging.getLogger('PINN_Final')
+    logger.setLevel(logging.INFO)
+    if not logger.handlers:
+        ch = logging.StreamHandler()
+        ch.setFormatter(logging.Formatter('%(message)s'))
+        logger.addHandler(ch)
+    return logger
 
-            # 提取 X (特征) 和 Y (SOH)
-            X = df.iloc[:, :-1].values.astype(np.float32)
-            Y = (df.iloc[:, -1].values / RATED_CAPACITY).astype(np.float32)
 
-            all_X.append(X)
-            all_Y.append(Y)
+logger = get_logger()
 
-        except Exception as e:
-            print(f"无法读取 {filename}: {e}")
-            continue
 
-    # 垂直合并所有数据
-    if len(all_X) == 0: raise ValueError("没有加载到任何数据！")
+class AverageMeter(object):
+    def __init__(self): self.reset()
 
-    X_concat = np.concatenate(all_X, axis=0)
-    Y_concat = np.concatenate(all_Y, axis=0)
+    def reset(self): self.val = 0; self.avg = 0; self.sum = 0; self.count = 0
 
-    return X_concat, Y_concat
+    def update(self, val, n=1):
+        self.val = val;
+        self.sum += val * n;
+        self.count += n;
+        self.avg = self.sum / self.count
 
 
 # ==========================================
-# 2. 模型定义 (保持不变)
+# 1. 模型定义 (保持原样)
 # ==========================================
-class BackboneNet(nn.Module):
+class Sin(nn.Module):
+    def forward(self, x): return torch.sin(x)
+
+
+class MLP(nn.Module):
+    def __init__(self, input_dim, output_dim=1, layers_num=4, hidden_dim=64, droupout=0.0):
+        super(MLP, self).__init__()
+        self.layers = []
+        for i in range(layers_num):
+            if i == 0:
+                self.layers.append(nn.Linear(input_dim, hidden_dim))
+                self.layers.append(Sin())
+            elif i == layers_num - 1:
+                self.layers.append(nn.Linear(hidden_dim, output_dim))
+            else:
+                self.layers.append(nn.Linear(hidden_dim, hidden_dim))
+                self.layers.append(Sin())
+                if droupout > 0: self.layers.append(nn.Dropout(p=droupout))
+        self.net = nn.Sequential(*self.layers)
+        for layer in self.net:
+            if isinstance(layer, nn.Linear): nn.init.xavier_normal_(layer.weight)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class Solution_u(nn.Module):
     def __init__(self, input_dim):
-        super(BackboneNet, self).__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, 128),  # 增加神经元以处理更多数据
-            nn.Tanh(),
-            nn.Linear(128, 64),
-            nn.Tanh(),
-            nn.Linear(64, 1),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x): return self.net(x)
-
-
-class DynamicsNet(nn.Module):
-    def __init__(self, input_dim):
-        super(DynamicsNet, self).__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim + 1, 32),
-            nn.Tanh(),
+        super(Solution_u, self).__init__()
+        self.encoder = MLP(input_dim=input_dim, output_dim=32, layers_num=3, hidden_dim=64)
+        self.predictor = nn.Sequential(
+            nn.Linear(32, 32),
+            Sin(),
             nn.Linear(32, 1)
         )
 
-    def forward(self, x): return self.net(x)
+    def forward(self, x):
+        x = self.encoder(x)
+        return self.predictor(x)
+
+
+class PINN(nn.Module):
+    def __init__(self, feature_dim, alpha=0.05, beta=0.05):
+        super(PINN, self).__init__()
+        self.solution_u = Solution_u(input_dim=feature_dim).to(DEVICE)
+
+        # 物理网络
+        dim_F = feature_dim + 1 + (feature_dim - 1) + 1
+        self.dynamical_F = MLP(input_dim=dim_F, output_dim=1, layers_num=3, hidden_dim=64).to(DEVICE)
+
+        self.loss_func = nn.MSELoss()
+        self.relu = nn.ReLU()
+        self.alpha = alpha  # PDE 权重
+        self.beta = beta  # 单调性权重
+
+    def forward(self, xt):
+        xt.requires_grad = True
+        x = xt[:, 0:-1]
+        t = xt[:, -1:]
+
+        u = self.solution_u(xt)
+
+        # 计算导数
+        u_t = grad(u.sum(), t, create_graph=True, only_inputs=True)[0]
+        u_x = grad(u.sum(), x, create_graph=True, only_inputs=True)[0]
+
+        F_input = torch.cat([xt, u, u_x, u_t], dim=1)
+        F = self.dynamical_F(F_input)
+
+        f = u_t - F
+        return u, f
 
 
 # ==========================================
-# 3. 训练逻辑
+# 2. 数据处理
 # ==========================================
 class BatteryDataset(Dataset):
     def __init__(self, X, y):
-        self.X = torch.tensor(X)
-        self.y = torch.tensor(y).view(-1, 1)
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.float32).view(-1, 1)
 
     def __len__(self): return len(self.X) - 1
 
-    def __getitem__(self, idx): return self.X[idx], self.y[idx], self.X[idx + 1]
+    def __getitem__(self, idx):
+        return self.X[idx], self.X[idx + 1], self.y[idx], self.y[idx + 1]
 
 
-def train_mlp(X, y, input_dim):
-    print(">>> [Baseline] Training MLP on Batteries 1-6...")
-    model = BackboneNet(input_dim).to(DEVICE)
-    optimizer = optim.Adam(model.parameters(), lr=LR)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=300, gamma=0.5)
+def load_data(folder):
+    train_ids = [1, 2, 3, 4, 5, 6]
+    test_ids = [7, 8]  # 测试集
 
-    loader = DataLoader(BatteryDataset(X, y), batch_size=64, shuffle=True)  # Batch加大
+    def read_ids(ids):
+        xs, ys = [], []
+        for bid in ids:
+            path = os.path.join(folder, f"2C_battery-{bid}.csv")
+            try:
+                df = pd.read_csv(path)
+                if df.shape[1] < 2: df = pd.read_csv(path, sep='\t')
+                df.replace([np.inf, -np.inf], np.nan, inplace=True);
+                df.dropna(inplace=True)
 
-    for epoch in range(EPOCHS):
+                feat = df.iloc[:, :-1].values
+                soh = df.iloc[:, -1].values / 2.0
+
+                # 添加时间列 t
+                t = np.linspace(0, 1, len(feat)).reshape(-1, 1)
+                x_combined = np.hstack((feat, t))
+
+                xs.append(x_combined)
+                ys.append(soh)
+            except:
+                pass
+        return np.concatenate(xs), np.concatenate(ys)
+
+    X_train, y_train = read_ids(train_ids)
+    X_test, y_test = read_ids(test_ids)
+
+    scaler = MinMaxScaler()
+    X_train = scaler.fit_transform(X_train)
+    X_test = scaler.transform(X_test)
+
+    return X_train, y_train, X_test, y_test
+
+
+# ==========================================
+# 3. 改进后的训练流程 (Warm-up Strategy)
+# ==========================================
+
+def train_baseline_mlp(X_train, y_train, input_dim, epochs=1000):
+    logger.info(f"\n>>> Training MLP (Baseline)...")
+    model = MLP(input_dim=input_dim, output_dim=1, layers_num=4, hidden_dim=64).to(DEVICE)
+    optimizer = optim.Adam(model.parameters(), lr=0.005)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=400, gamma=0.5)
+
+    dataset = BatteryDataset(X_train, y_train)
+    loader = DataLoader(dataset, batch_size=512, shuffle=True)
+
+    for epoch in range(epochs):
         model.train()
-        for x_k, y_k, _ in loader:
-            x_k, y_k = x_k.to(DEVICE), y_k.to(DEVICE)
-            optimizer.zero_grad()
-            pred = model(x_k)
-            loss = nn.MSELoss()(pred, y_k)
-            loss.backward()
+        for x1, _, y1, _ in loader:
+            x1, y1 = x1.to(DEVICE), y1.to(DEVICE)
+            pred = model(x1)
+            loss = nn.MSELoss()(pred, y1)
+            optimizer.zero_grad();
+            loss.backward();
             optimizer.step()
         scheduler.step()
     return model
 
 
-def train_pinn(X, y, input_dim):
-    print(">>> [Proposed] Training PINN on Batteries 1-6...")
-    net_f = BackboneNet(input_dim).to(DEVICE)
-    net_g = DynamicsNet(input_dim).to(DEVICE)
-    optimizer = optim.Adam(list(net_f.parameters()) + list(net_g.parameters()), lr=LR)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=300, gamma=0.5)
+def train_pinn_with_warmup(X_train, y_train, input_dim, epochs=1000, warmup=200):
+    """
+    关键修改：加入 warmup 阶段
+    - 前 warmup 轮：alpha=0, beta=0 (只像 MLP 一样学数据)
+    - 后续：加入物理约束进行微调
+    """
+    logger.info(f"\n>>> Training PINN (With Warm-up Strategy)...")
 
-    loader = DataLoader(BatteryDataset(X, y), batch_size=64, shuffle=True)
+    # 注意：这里把 alpha/beta 调小了一点，防止物理约束过强导致欠拟合
+    model = PINN(feature_dim=input_dim, alpha=0.01, beta=0.05).to(DEVICE)
 
-    for epoch in range(EPOCHS):
-        net_f.train();
-        net_g.train()
-        for x_k, y_k, x_k1 in loader:
-            x_k, y_k, x_k1 = x_k.to(DEVICE), y_k.to(DEVICE), x_k1.to(DEVICE)
-            optimizer.zero_grad()
+    opt1 = optim.Adam(model.solution_u.parameters(), lr=0.005)  # 主网络
+    opt2 = optim.Adam(model.dynamical_F.parameters(), lr=0.005)  # 物理网络
 
-            # Loss 1: Data
-            u_k = net_f(x_k)
-            loss_data = nn.MSELoss()(u_k, y_k)
+    sch1 = optim.lr_scheduler.StepLR(opt1, step_size=400, gamma=0.5)
+    sch2 = optim.lr_scheduler.StepLR(opt2, step_size=400, gamma=0.5)
 
-            # Loss 2: Physics
-            u_k1_f = net_f(x_k1)
-            inp_g = torch.cat([u_k.detach(), x_k], dim=1)
-            delta = net_g(inp_g)
-            u_k1_phy = u_k + delta
-            loss_phy = nn.MSELoss()(u_k1_f, u_k1_phy)
+    dataset = BatteryDataset(X_train, y_train)
+    loader = DataLoader(dataset, batch_size=512, shuffle=True)
 
-            # Loss 3: Mono
-            loss_mono = torch.mean(torch.relu(delta))
+    for epoch in range(epochs):
+        model.train()
+        l1_m = AverageMeter();
+        l2_m = AverageMeter();
+        l3_m = AverageMeter()
 
-            loss = loss_data + LAMBDA_PHY * loss_phy + LAMBDA_MONO * loss_mono
-            loss.backward()
-            optimizer.step()
-        scheduler.step()
-    return net_f
+        # 动态调整物理权重：Warmup 阶段为 0
+        current_alpha = 0.0 if epoch < warmup else model.alpha
+        current_beta = 0.0 if epoch < warmup else model.beta
+
+        for x1, x2, y1, y2 in loader:
+            x1, x2 = x1.to(DEVICE), x2.to(DEVICE)
+            y1, y2 = y1.to(DEVICE), y2.to(DEVICE)
+
+            u1, f1 = model(x1)
+            u2, f2 = model(x2)
+
+            # 1. Data Loss
+            l_data = 0.5 * nn.MSELoss()(u1, y1) + 0.5 * nn.MSELoss()(u2, y2)
+
+            # 2. PDE Loss (Warmup 时忽略)
+            l_pde = torch.tensor(0.0).to(DEVICE)
+            if current_alpha > 0:
+                f_target = torch.zeros_like(f1)
+                l_pde = 0.5 * nn.MSELoss()(f1, f_target) + 0.5 * nn.MSELoss()(f2, f_target)
+
+            # 3. Mono Loss (Warmup 时忽略)
+            l_phy = torch.tensor(0.0).to(DEVICE)
+            if current_beta > 0:
+                # 约束：预测的衰减方向应该和真实数据一致，且应该平滑
+                # 如果真实数据衰减(y1>y2)，预测必须衰减(u1>u2)
+                l_phy = model.relu((u2 - u1) * (y1 - y2)).sum()
+
+            total_loss = l_data + current_alpha * l_pde + current_beta * l_phy
+
+            opt1.zero_grad();
+            opt2.zero_grad()
+            total_loss.backward()
+            opt1.step();
+            opt2.step()
+
+            l1_m.update(l_data.item());
+            l2_m.update(l_pde.item());
+            l3_m.update(l_phy.item())
+
+        sch1.step();
+        sch2.step()
+
+        if (epoch + 1) % 100 == 0:
+            status = "Warmup" if epoch < warmup else "Physics-Informed"
+            logger.info(
+                f"[PINN] Epoch {epoch + 1} ({status}): Data {l1_m.avg:.5f} | PDE {l2_m.avg:.5f} | Mono {l3_m.avg:.5f}")
+
+    return model
 
 
 # ==========================================
 # 4. 主程序
 # ==========================================
 if __name__ == "__main__":
-    # 1. 数据划分策略
-    # 训练集: 电池 1, 2, 3, 4, 5, 6
-    # 测试集: 电池 7, 8 (完全没见过的数据，考验泛化能力)
-    train_ids = [1, 2, 3, 4, 5, 6]
-    test_ids = [7, 8]
+    # A. 数据
+    X_train, y_train, X_test, y_test = load_data(DATA_FOLDER)
+    feat_dim = X_train.shape[1]
+    logger.info(f"Train: {len(X_train)}, Test: {len(X_test)}")
 
-    # 2. 加载合并数据
-    X_train_raw, y_train = load_battery_data(DATA_FOLDER, train_ids)
-    X_test_raw, y_test = load_battery_data(DATA_FOLDER, test_ids)
+    # B. 训练 (对比 1000 轮)
+    mlp_model = train_baseline_mlp(X_train, y_train, feat_dim, epochs=1000)
+    pinn_model = train_pinn_with_warmup(X_train, y_train, feat_dim, epochs=1000, warmup=200)
 
-    # 3. 归一化 (注意：必须只在训练集上fit，应用到测试集)
-    scaler = MinMaxScaler()
-    X_train = scaler.fit_transform(X_train_raw)
-    X_test = scaler.transform(X_test_raw)  # transform ONLY
+    # C. 评估
+    mlp_model.eval();
+    pinn_model.eval()
 
-    input_dim = X_train.shape[1]
-    print(f"特征维度: {input_dim}")
-    print(f"训练样本数: {len(X_train)}, 测试样本数: {len(X_test)}")
-
-    # 4. 训练
-    model_mlp = train_mlp(X_train, y_train, input_dim)
-    model_pinn = train_pinn(X_train, y_train, input_dim)
-
-    # 5. 评估
-    model_mlp.eval();
-    model_pinn.eval()
     with torch.no_grad():
-        inputs_test = torch.tensor(X_test).to(DEVICE)
-        pred_mlp = model_mlp(inputs_test).cpu().numpy()
-        pred_pinn = model_pinn(inputs_test).cpu().numpy()
+        inputs = torch.tensor(X_test, dtype=torch.float32).to(DEVICE)
+        pred_mlp = mlp_model(inputs).cpu().numpy()
+        pred_pinn = pinn_model.solution_u(inputs).cpu().numpy()
 
     rmse_mlp = np.sqrt(mean_squared_error(y_test, pred_mlp))
     rmse_pinn = np.sqrt(mean_squared_error(y_test, pred_pinn))
-    imp = ((rmse_mlp - rmse_pinn) / rmse_mlp) * 100
 
-    print("\n" + "=" * 40)
-    print(f"测试集结果 (Batteries {test_ids})")
-    print("=" * 40)
-    print(f"MLP RMSE : {rmse_mlp:.5f}")
-    print(f"PINN RMSE: {rmse_pinn:.5f}")
-    print(f"提升比例 : {imp:.2f}%")
-    print("=" * 40)
+    # 计算提升百分比
+    imp = (rmse_mlp - rmse_pinn) / rmse_mlp * 100
 
-    # 6. 绘图
-    # 为了图表好看，我们只画出 测试集中 某一个电池 的连续曲线
-    # 比如只画测试数据的后半部分（对应电池 8）
-    # 因为直接画所有测试集，两个电池的数据拼接处会断崖，不好看
+    logger.info("\n" + "=" * 40)
+    logger.info(f"FINAL RESULT COMPARISON")
+    logger.info("=" * 40)
+    logger.info(f"MLP  RMSE: {rmse_mlp:.5f}")
+    logger.info(f"PINN RMSE: {rmse_pinn:.5f}")
+    logger.info(f"Improvement: {imp:.2f}%")
+    logger.info("=" * 40)
 
-    plt.figure(figsize=(10, 6))
+    # D. 绘图
+    plt.figure(figsize=(12, 6))
 
-    # 简单的切分一下用于展示 (假设数据量大致均分，取后半段展示电池8)
-    display_start = int(len(y_test) * 0.5)
+    # 为了展示效果，我们只画 Test Set 中后半段的数据（对应 Battery 8）
+    # 这样曲线是连续的，不会因为 Battery 7 跳到 Battery 8 而断裂
+    start_idx = int(len(y_test) * 0.5)
+    cycles = np.arange(len(y_test[start_idx:]))
 
-    cycle_idx = np.arange(len(y_test[display_start:]))
+    plt.plot(cycles, y_test[start_idx:], 'k-', label='True SOH', linewidth=2, alpha=0.5)
+    plt.plot(cycles, pred_mlp[start_idx:], 'b:', label=f'MLP ({rmse_mlp:.4f})', linewidth=1.5)
+    plt.plot(cycles, pred_pinn[start_idx:], 'r-', label=f'PINN ({rmse_pinn:.4f})', linewidth=2)  # 实线强调
 
-    plt.plot(cycle_idx, y_test[display_start:], 'k-', label='True SOH (Battery 8)', linewidth=2, alpha=0.6)
-    plt.plot(cycle_idx, pred_mlp[display_start:], 'b:', label=f'MLP (RMSE={rmse_mlp:.4f})', linewidth=1.5)
-    plt.plot(cycle_idx, pred_pinn[display_start:], 'r--', label=f'PINN (RMSE={rmse_pinn:.4f})', linewidth=2)
-
-    plt.title(f'Generalization Test on Unseen Battery (No.{test_ids[-1]})')
-    plt.xlabel('Cycle Number')
+    plt.title(f'Generalization on Unseen Battery (Imp: {imp:.2f}%)')
+    plt.xlabel('Cycle')
     plt.ylabel('SOH')
     plt.legend()
     plt.grid(True, alpha=0.3)
 
     plt.savefig(SAVE_IMG_PATH, dpi=300, bbox_inches='tight')
-    print(f"\n图片已保存: {SAVE_IMG_PATH}")
+    logger.info(f"Result saved to {SAVE_IMG_PATH}")
     plt.show()
